@@ -49,6 +49,22 @@ class FxcacheDB:
         finally:
             conn.close()
 
+    def _get_meta(self, key: str) -> str | None:
+        conn = self._get_conn()
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+            return row['value'] if row else None
+        finally:
+            conn.close()
+
+    def _set_meta(self, conn, key: str, value: str):
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+
+    def get_last_refresh_time(self) -> float | None:
+        """Return the timestamp of the last completed refresh, or None."""
+        val = self._get_meta('last_refresh_timestamp')
+        return float(val) if val else None
+
     def exists(self, path: str) -> dict:
         conn = self._get_conn()
         try:
@@ -101,20 +117,104 @@ class FxcacheDB:
         finally:
             conn.close()
 
-    def refresh_full(self):
+    def refresh(self, mode: str = 'auto'):
+        """Start a refresh. mode: 'auto', 'full', or 'incremental'."""
         if self._refresh_running:
             return False
+        if mode == 'auto':
+            mode = 'incremental' if self.get_last_refresh_time() else 'full'
         self._refresh_running = True
         self._refresh_status = {
             'status': 'running',
+            'mode': mode,
             'files_scanned': 0,
+            'files_added': 0,
             'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
         }
-        t = threading.Thread(target=self._refresh_worker, daemon=True)
+        t = threading.Thread(target=self._refresh_worker, args=(mode,), daemon=True)
         t.start()
         return True
 
-    def _refresh_worker(self):
+    # Keep old name as alias
+    def refresh_full(self):
+        return self.refresh(mode='full')
+
+    def _refresh_worker(self, mode: str):
+        if mode == 'incremental':
+            self._refresh_incremental()
+        else:
+            self._refresh_full()
+
+    def _refresh_incremental(self):
+        """Only index files newer than last refresh timestamp."""
+        start = time.time()
+        since = self.get_last_refresh_time() or 0
+        scanned = 0
+        added = 0
+        try:
+            conn = self._get_conn()
+            batch = []
+            for dirpath, _dirnames, filenames in os.walk(self.fxcache_path):
+                for fname in filenames:
+                    if fname.startswith('.'):
+                        continue
+                    full_path = os.path.join(dirpath, fname)
+                    try:
+                        st = os.stat(full_path)
+                    except OSError:
+                        continue
+                    scanned += 1
+                    if st.st_mtime <= since:
+                        continue
+                    rel_path = os.path.relpath(full_path, self.fxcache_path)
+                    batch.append((rel_path, st.st_size, st.st_mtime))
+                    added += 1
+                    if added % 500 == 0:
+                        self._refresh_status['files_scanned'] = scanned
+                        self._refresh_status['files_added'] = added
+                        with self._write_lock:
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
+                                batch
+                            )
+                            conn.commit()
+                        batch = []
+                    if scanned % 5000 == 0:
+                        self._refresh_status['files_scanned'] = scanned
+
+            if batch:
+                with self._write_lock:
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
+                        batch
+                    )
+                    conn.commit()
+
+            # Update meta
+            refresh_ts = time.time()
+            with self._write_lock:
+                self._set_meta(conn, 'last_refresh_timestamp', str(refresh_ts))
+                self._set_meta(conn, 'last_refresh', time.strftime('%Y-%m-%dT%H:%M:%S'))
+                conn.commit()
+
+            conn.close()
+            duration = time.time() - start
+            self._refresh_status = {
+                'status': 'complete',
+                'mode': 'incremental',
+                'files_scanned': scanned,
+                'files_added': added,
+                'duration_seconds': round(duration, 1),
+            }
+            logger.info(f"Incremental refresh: scanned {scanned}, added {added} new files in {duration:.1f}s")
+
+        except Exception as e:
+            logger.error(f"Incremental refresh failed: {e}")
+            self._refresh_status = {'status': 'error', 'error': str(e)}
+        finally:
+            self._refresh_running = False
+
+    def _refresh_full(self):
         start = time.time()
         scanned = 0
         found_paths = set()
@@ -166,29 +266,26 @@ class FxcacheDB:
                     conn.commit()
 
             # Update meta
+            refresh_ts = time.time()
             with self._write_lock:
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                    ('last_full_refresh', time.strftime('%Y-%m-%dT%H:%M:%S'))
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                    ('file_count', str(scanned))
-                )
+                self._set_meta(conn, 'last_refresh_timestamp', str(refresh_ts))
+                self._set_meta(conn, 'last_refresh', time.strftime('%Y-%m-%dT%H:%M:%S'))
+                self._set_meta(conn, 'file_count', str(scanned))
                 conn.commit()
 
             conn.close()
             duration = time.time() - start
             self._refresh_status = {
                 'status': 'complete',
+                'mode': 'full',
                 'total_files': scanned,
                 'stale_removed': len(stale),
                 'duration_seconds': round(duration, 1),
             }
-            logger.info(f"Database refresh complete: {scanned} files indexed, {len(stale)} stale removed in {duration:.1f}s")
+            logger.info(f"Full refresh: {scanned} files indexed, {len(stale)} stale removed in {duration:.1f}s")
 
         except Exception as e:
-            logger.error(f"Database refresh failed: {e}")
+            logger.error(f"Full refresh failed: {e}")
             self._refresh_status = {'status': 'error', 'error': str(e)}
         finally:
             self._refresh_running = False

@@ -81,6 +81,7 @@ def health():
         'status': 'ok',
         'fxcache_path': FXCACHE_PATH,
         'db_file_count': db.file_count(),
+        'last_refresh': db._get_meta('last_refresh'),
         'uptime_seconds': round(uptime, 1),
         'stats': stats,
     })
@@ -164,10 +165,13 @@ def upload():
 
 @app.route('/refresh', methods=['POST'])
 def refresh():
-    started = db.refresh_full()
+    mode = request.args.get('mode', 'auto')  # 'auto', 'full', or 'incremental'
+    if mode not in ('auto', 'full', 'incremental'):
+        return jsonify({'error': 'Invalid mode. Use: auto, full, incremental'}), 400
+    started = db.refresh(mode=mode)
     if not started:
         return jsonify({'status': 'already_running'}), 409
-    return jsonify({'status': 'started', 'message': 'Database refresh started in background'})
+    return jsonify({'status': 'started', 'mode': mode, 'message': 'Database refresh started in background'})
 
 
 @app.route('/refresh/status', methods=['GET'])
@@ -222,10 +226,18 @@ def main():
     db_path = os.path.join(FXCACHE_PATH, '.fxcache_index.db')
     db = FxcacheDB(db_path, FXCACHE_PATH)
 
-    # Auto-refresh if DB is empty
+    # Auto-refresh: full if DB is empty, incremental if DB has a previous refresh
     if db.file_count() == 0:
-        logger.info("Database is empty, starting initial refresh...")
-        db.refresh_full()
+        logger.info("Database is empty, starting full refresh...")
+        db.refresh(mode='full')
+    else:
+        last = db.get_last_refresh_time()
+        if last:
+            logger.info(f"Database has {db.file_count()} files, starting incremental refresh...")
+            db.refresh(mode='incremental')
+        else:
+            logger.info(f"Database has {db.file_count()} files but no refresh timestamp, starting full refresh...")
+            db.refresh(mode='full')
 
     stats['start_time'] = datetime.now()
     print_startup_banner(args.host, args.port)
