@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json as _json
 import logging
 import os
 import socket
@@ -23,6 +24,9 @@ from flask import Flask, jsonify, request, send_file
 from db import FxcacheDB
 
 app = Flask(__name__)
+
+# In-memory store for debug logs (keyed by machine name)
+_debug_logs: dict[str, dict] = {}
 
 # Logging
 logging.basicConfig(
@@ -179,6 +183,89 @@ def refresh_status():
     return jsonify(db.get_refresh_status())
 
 
+# --- Debug log sharing ---
+
+@app.route('/debug/log', methods=['POST'])
+def debug_log_post():
+    """Post a debug log from a machine. Body: JSON with 'machine' key."""
+    data = request.get_json(silent=True)
+    if not data or 'machine' not in data:
+        return jsonify({'error': 'Missing machine field'}), 400
+    machine = data['machine']
+    data['posted_at'] = datetime.now().isoformat()
+    _debug_logs[machine] = data
+    logger.info(f"Debug log received from '{machine}' ({len(_json.dumps(data))} bytes)")
+    return jsonify({'status': 'ok', 'machine': machine})
+
+
+@app.route('/debug/log', methods=['GET'])
+def debug_log_get():
+    """Get debug logs. ?machine=X for specific, or all."""
+    machine = request.args.get('machine', '')
+    if machine:
+        log = _debug_logs.get(machine)
+        if log is None:
+            return jsonify({'error': f'No log for machine: {machine}'}), 404
+        return jsonify(log)
+    return jsonify(_debug_logs)
+
+
+@app.route('/debug/log/list', methods=['GET'])
+def debug_log_list():
+    """List all machines that have posted debug logs."""
+    return jsonify({
+        'machines': list(_debug_logs.keys()),
+        'count': len(_debug_logs),
+    })
+
+
+@app.route('/debug/compare', methods=['GET'])
+def debug_compare():
+    """Compare debug logs from two machines. Shows only differences."""
+    machines = list(_debug_logs.keys())
+    if len(machines) < 2:
+        return jsonify({'error': f'Need 2 logs, have {len(machines)}: {machines}'}), 400
+    m1 = request.args.get('m1', machines[0])
+    m2 = request.args.get('m2', machines[1])
+    log1 = _debug_logs.get(m1)
+    log2 = _debug_logs.get(m2)
+    if not log1 or not log2:
+        return jsonify({'error': f'Missing log for {m1 if not log1 else m2}'}), 404
+
+    diffs = _diff_logs(log1, log2, m1, m2)
+    return jsonify({'m1': m1, 'm2': m2, 'diffs': diffs, 'match': len(diffs) == 0})
+
+
+def _diff_logs(log1: dict, log2: dict, name1: str, name2: str) -> list:
+    """Recursively compare two debug log dicts, return list of differences."""
+    diffs = []
+    skip_keys = {'machine', 'posted_at', 'hostname'}
+    all_keys = set(log1.keys()) | set(log2.keys())
+    for key in sorted(all_keys - skip_keys):
+        v1 = log1.get(key)
+        v2 = log2.get(key)
+        if isinstance(v1, list) and isinstance(v2, list) and len(v1) == len(v2):
+            # Compare list items (e.g. processors_shas)
+            for i, (item1, item2) in enumerate(zip(v1, v2)):
+                if isinstance(item1, dict) and isinstance(item2, dict):
+                    for k in sorted(set(item1.keys()) | set(item2.keys())):
+                        if item1.get(k) != item2.get(k):
+                            diffs.append({
+                                'key': f'{key}[{i}].{k}',
+                                name1: item1.get(k),
+                                name2: item2.get(k),
+                            })
+                elif item1 != item2:
+                    diffs.append({'key': f'{key}[{i}]', name1: item1, name2: item2})
+        elif v1 != v2:
+            # Truncate long strings for readability
+            d = {'key': key}
+            d[name1] = str(v1)[:500] if isinstance(v1, str) and len(str(v1)) > 500 else v1
+            d[name2] = str(v2)[:500] if isinstance(v2, str) and len(str(v2)) > 500 else v2
+            diffs.append(d)
+    return diffs
+
+
 # --- Startup ---
 
 def print_startup_banner(host: str, port: int):
@@ -202,6 +289,10 @@ def print_startup_banner(host: str, port: int):
     print(f"  POST /upload?path=    - Upload file")
     print(f"  POST /refresh         - Rebuild SQLite index")
     print(f"  GET  /refresh/status  - Refresh progress")
+    print(f"  POST /debug/log       - Post debug log from a machine")
+    print(f"  GET  /debug/log       - Get debug logs (?machine=X)")
+    print(f"  GET  /debug/log/list  - List machines with logs")
+    print(f"  GET  /debug/compare   - Compare logs from two machines")
     print()
 
 
