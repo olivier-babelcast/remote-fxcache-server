@@ -78,6 +78,34 @@ def _validate_path(rel_path: str) -> str | None:
 
 # --- Endpoints ---
 
+@app.route('/', methods=['GET'])
+def index():
+    endpoints = [
+        ('GET',  '/health',         'Health check with stats'),
+        ('GET',  '/exists?path=',   'Check file existence'),
+        ('POST', '/exists_batch',   'Batch existence check'),
+        ('GET',  '/download?path=', 'Download a file'),
+        ('POST', '/upload?path=',   'Upload a file'),
+        ('GET',  '/refresh',        'Incremental refresh (Spotlight)'),
+        ('GET',  '/rebuild',        'Full rebuild (walks entire FXCACHE)'),
+        ('GET',  '/refresh/status', 'Refresh/rebuild progress'),
+        ('POST', '/debug/log',      'Post debug log from a machine'),
+        ('GET',  '/debug/log',      'Get debug logs (?machine=X)'),
+        ('GET',  '/debug/log/list', 'List machines with logs'),
+        ('GET',  '/debug/compare',  'Compare logs from two machines'),
+    ]
+    rows = ''.join(
+        f'<tr><td>{method}</td><td><a href="{path}">{path}</a></td><td>{desc}</td></tr>'
+        for method, path, desc in endpoints
+    )
+    return f'''<html><head><title>Remote FXCACHE Server</title>
+<style>body{{font-family:monospace;margin:2em}}table{{border-collapse:collapse}}
+td,th{{padding:4px 12px;text-align:left;border-bottom:1px solid #ddd}}</style>
+</head><body><h2>Remote FXCACHE Server</h2>
+<table><tr><th>Method</th><th>Path</th><th>Description</th></tr>{rows}</table>
+</body></html>'''
+
+
 @app.route('/health', methods=['GET'])
 def health():
     uptime = (datetime.now() - stats['start_time']).total_seconds() if stats['start_time'] else 0
@@ -167,15 +195,20 @@ def upload():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/refresh', methods=['POST'])
+@app.route('/refresh', methods=['POST', 'GET'])
 def refresh():
-    mode = request.args.get('mode', 'auto')  # 'auto', 'full', or 'incremental'
-    if mode not in ('auto', 'full', 'incremental'):
-        return jsonify({'error': 'Invalid mode. Use: auto, full, incremental'}), 400
-    started = db.refresh(mode=mode)
+    started = db.refresh(mode='incremental')
     if not started:
         return jsonify({'status': 'already_running'}), 409
-    return jsonify({'status': 'started', 'mode': mode, 'message': 'Database refresh started in background'})
+    return jsonify({'status': 'started', 'mode': 'incremental', 'message': 'Incremental refresh started (Spotlight)'})
+
+
+@app.route('/rebuild', methods=['POST', 'GET'])
+def rebuild():
+    started = db.refresh(mode='full')
+    if not started:
+        return jsonify({'status': 'already_running'}), 409
+    return jsonify({'status': 'started', 'mode': 'full', 'message': 'Full rebuild started (walks entire FXCACHE)'})
 
 
 @app.route('/refresh/status', methods=['GET'])
@@ -276,23 +309,28 @@ def print_startup_banner(host: str, port: int):
     print("=" * 60)
     print(f"Local IP:    {local_ip}")
     print(f"Port:        {port}")
-    print(f"URL:         http://{local_ip}:{port}")
+    print(f"URL:         \033]8;;http://{local_ip}:{port}\033\\http://{local_ip}:{port}\033]8;;\033\\")
     print(f"FXCACHE:     {FXCACHE_PATH}")
     print(f"DB files:    {db.file_count()}")
     print("=" * 60)
     print()
+    base = f"http://{local_ip}:{port}"
+    def _link(path, label):
+        return f"\033]8;;{base}{path}\033\\{label}\033]8;;\033\\"
+
     print("Endpoints:")
-    print(f"  GET  /health          - Health check")
-    print(f"  GET  /exists?path=    - Check file existence (fast)")
-    print(f"  POST /exists_batch    - Batch existence check")
-    print(f"  GET  /download?path=  - Download file")
-    print(f"  POST /upload?path=    - Upload file")
-    print(f"  POST /refresh         - Rebuild SQLite index")
-    print(f"  GET  /refresh/status  - Refresh progress")
-    print(f"  POST /debug/log       - Post debug log from a machine")
-    print(f"  GET  /debug/log       - Get debug logs (?machine=X)")
-    print(f"  GET  /debug/log/list  - List machines with logs")
-    print(f"  GET  /debug/compare   - Compare logs from two machines")
+    print(f"  GET  {_link('/health', '/health'):<50s} Health check")
+    print(f"  GET  {_link('/exists?path=', '/exists?path='):<50s} Check file existence (fast)")
+    print(f"  POST {_link('/exists_batch', '/exists_batch'):<50s} Batch existence check")
+    print(f"  GET  {_link('/download?path=', '/download?path='):<50s} Download file")
+    print(f"  POST {_link('/upload?path=', '/upload?path='):<50s} Upload file")
+    print(f"  GET  {_link('/refresh', '/refresh'):<50s} Incremental refresh (Spotlight)")
+    print(f"  GET  {_link('/rebuild', '/rebuild'):<50s} Full rebuild (walks entire FXCACHE)")
+    print(f"  GET  {_link('/refresh/status', '/refresh/status'):<50s} Refresh/rebuild progress")
+    print(f"  POST {_link('/debug/log', '/debug/log'):<50s} Post debug log from a machine")
+    print(f"  GET  {_link('/debug/log', '/debug/log'):<50s} Get debug logs (?machine=X)")
+    print(f"  GET  {_link('/debug/log/list', '/debug/log/list'):<50s} List machines with logs")
+    print(f"  GET  {_link('/debug/compare', '/debug/compare'):<50s} Compare logs from two machines")
     print()
 
 
