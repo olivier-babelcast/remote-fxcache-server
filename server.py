@@ -305,7 +305,7 @@ def main():
     parser.add_argument('--host', type=str, default=os.environ.get('FXCACHE_SERVER_HOST', '0.0.0.0'),
                         help='Host to bind to (default: 0.0.0.0)')
     parser.add_argument('--fxcache-path', type=str,
-                        default=os.environ.get('FXCACHE_PATH', os.path.expanduser('~/GitHub/FX5/FXCACHE')),
+                        default=os.environ.get('FXCACHE_PATH', '/Volumes/FD_1TB_EXT/FXCACHE'),
                         help='Path to FXCACHE directory')
     args = parser.parse_args()
 

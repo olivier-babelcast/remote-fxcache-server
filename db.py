@@ -8,6 +8,7 @@ without scanning the filesystem on every request.
 import logging
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 
@@ -146,41 +147,50 @@ class FxcacheDB:
             self._refresh_full()
 
     def _refresh_incremental(self):
-        """Only index files newer than last refresh timestamp."""
+        """Index files newer than last refresh using macOS Spotlight (mdfind)."""
         start = time.time()
         since = self.get_last_refresh_time() or 0
-        scanned = 0
         added = 0
         try:
+            # Convert timestamp to days ago for mdfind
+            days_ago = (time.time() - since) / 86400
+            # Add a small buffer to avoid missing files at the boundary
+            days_ago = days_ago + 0.01
+
+            result = subprocess.run(
+                ['mdfind', '-onlyin', self.fxcache_path,
+                 f'kMDItemFSContentChangeDate >= $time.today(-{days_ago})'],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"mdfind failed: {result.stderr.strip()}")
+
+            paths = [p for p in result.stdout.splitlines() if p]
+            self._refresh_status['files_scanned'] = len(paths)
+
             conn = self._get_conn()
             batch = []
-            for dirpath, _dirnames, filenames in os.walk(self.fxcache_path):
-                for fname in filenames:
-                    if fname.startswith('.'):
-                        continue
-                    full_path = os.path.join(dirpath, fname)
-                    try:
-                        st = os.stat(full_path)
-                    except OSError:
-                        continue
-                    scanned += 1
-                    if st.st_mtime <= since:
-                        continue
-                    rel_path = os.path.relpath(full_path, self.fxcache_path)
-                    batch.append((rel_path, st.st_size, st.st_mtime))
-                    added += 1
-                    if added % 500 == 0:
-                        self._refresh_status['files_scanned'] = scanned
-                        self._refresh_status['files_added'] = added
-                        with self._write_lock:
-                            conn.executemany(
-                                "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
-                                batch
-                            )
-                            conn.commit()
-                        batch = []
-                    if scanned % 5000 == 0:
-                        self._refresh_status['files_scanned'] = scanned
+            for full_path in paths:
+                if os.path.basename(full_path).startswith('.'):
+                    continue
+                if not os.path.isfile(full_path):
+                    continue
+                try:
+                    st = os.stat(full_path)
+                except OSError:
+                    continue
+                rel_path = os.path.relpath(full_path, self.fxcache_path)
+                batch.append((rel_path, st.st_size, st.st_mtime))
+                added += 1
+                if len(batch) >= 500:
+                    self._refresh_status['files_added'] = added
+                    with self._write_lock:
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
+                            batch
+                        )
+                        conn.commit()
+                    batch = []
 
             if batch:
                 with self._write_lock:
@@ -202,11 +212,11 @@ class FxcacheDB:
             self._refresh_status = {
                 'status': 'complete',
                 'mode': 'incremental',
-                'files_scanned': scanned,
+                'files_from_spotlight': len(paths),
                 'files_added': added,
                 'duration_seconds': round(duration, 1),
             }
-            logger.info(f"Incremental refresh: scanned {scanned}, added {added} new files in {duration:.1f}s")
+            logger.info(f"Incremental refresh (Spotlight): {len(paths)} candidates, {added} indexed in {duration:.1f}s")
 
         except Exception as e:
             logger.error(f"Incremental refresh failed: {e}")
