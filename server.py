@@ -64,6 +64,51 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+FXCACHE_VERSION = '8'  # Must match constants.FXCACHE_VERSION in FX5
+
+
+def _lmdb_key_to_path(key: str) -> str | None:
+    """Map an LMDB key to a FXCACHE relative file path.
+
+    Allows clients using the new LMDB key scheme to download from
+    the FXCACHE-backed server without needing to know file paths.
+    """
+    parts = key.split(':')
+    prefix = parts[0]
+
+    if prefix == 'tb' and len(parts) >= 3:
+        return f"TB/{parts[1]}_{':'.join(parts[2:])}.pkl"
+    if prefix == 'mt' and len(parts) >= 2:
+        rest = ':'.join(parts[1:])
+        return f"MT/result_{rest}.pkl" if rest.startswith('0x') else f"MT/{rest}.pkl"
+    if prefix == 'fit' and len(parts) >= 2:
+        return f"FIT/opt_{parts[1]}.pkl"
+    if prefix == 'tt' and len(parts) >= 2:
+        return f"TT/cached_{parts[1]}.pkl"
+    if prefix == 'price' and len(parts) >= 6:
+        broker, session, tf, instr = parts[1], parts[2], parts[3], parts[4]
+        name = ':'.join(parts[5:])
+        return f"{broker}-{session}-tf_{tf}/{instr}/{name}.pkl"
+    if prefix == 'meta' and len(parts) >= 4:
+        broker, instr = parts[1], parts[2]
+        name = ':'.join(parts[3:])
+        return f"{FXCACHE_VERSION}/{broker}/{instr}/{name}.json"
+    return None
+
+
+def _resolve_path(path_or_key: str) -> str | None:
+    """Resolve a path parameter — accepts both FXCACHE paths and LMDB keys."""
+    if not path_or_key:
+        return None
+    # Detect LMDB key format (starts with known prefix followed by colon)
+    if ':' in path_or_key and path_or_key.split(':')[0] in ('tb', 'mt', 'fit', 'tt', 'price', 'meta'):
+        resolved = _lmdb_key_to_path(path_or_key)
+        if resolved:
+            return _validate_path(resolved)
+        return None
+    return _validate_path(path_or_key)
+
+
 def _validate_path(rel_path: str) -> str | None:
     """Validate and normalize a relative path. Returns None if invalid."""
     if not rel_path:
@@ -122,7 +167,7 @@ def health():
 @app.route('/exists', methods=['GET'])
 def exists():
     rel_path = request.args.get('path', '')
-    validated = _validate_path(rel_path)
+    validated = _resolve_path(rel_path)
     if validated is None:
         return jsonify({'error': 'Invalid path'}), 400
     stats['exists_checks'] += 1
@@ -150,7 +195,7 @@ def exists_batch():
 @app.route('/download', methods=['GET'])
 def download():
     rel_path = request.args.get('path', '')
-    validated = _validate_path(rel_path)
+    validated = _resolve_path(rel_path)
     if validated is None:
         return jsonify({'error': 'Invalid path'}), 400
     full_path = os.path.join(FXCACHE_PATH, validated)
@@ -170,7 +215,7 @@ def download():
 @app.route('/upload', methods=['POST'])
 def upload():
     rel_path = request.args.get('path', '')
-    validated = _validate_path(rel_path)
+    validated = _resolve_path(rel_path)
     if validated is None:
         return jsonify({'error': 'Invalid path'}), 400
     full_path = os.path.join(FXCACHE_PATH, validated)
@@ -322,8 +367,8 @@ def print_startup_banner(host: str, port: int):
     print(f"  GET  {_link('/health', '/health'):<50s} Health check")
     print(f"  GET  {_link('/exists?path=', '/exists?path='):<50s} Check file existence (fast)")
     print(f"  POST {_link('/exists_batch', '/exists_batch'):<50s} Batch existence check")
-    print(f"  GET  {_link('/download?path=', '/download?path='):<50s} Download file")
-    print(f"  POST {_link('/upload?path=', '/upload?path='):<50s} Upload file")
+    print(f"  GET  {_link('/download?path=', '/download?path='):<50s} Download file (LMDB keys or paths)")
+    print(f"  POST {_link('/upload?path=', '/upload?path='):<50s} Upload file (LMDB keys or paths)")
     print(f"  GET  {_link('/refresh', '/refresh'):<50s} Incremental refresh (Spotlight)")
     print(f"  GET  {_link('/rebuild', '/rebuild'):<50s} Full rebuild (walks entire FXCACHE)")
     print(f"  GET  {_link('/refresh/status', '/refresh/status'):<50s} Refresh/rebuild progress")
