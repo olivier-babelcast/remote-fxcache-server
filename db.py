@@ -1,304 +1,78 @@
 """
-SQLite index for FXCACHE files.
+LMDB wrapper for the remote FXCACHE server.
 
-Provides fast existence checks and file metadata lookups
-without scanning the filesystem on every request.
+Provides direct access to the LMDB database (DARTDb) that replaced
+the filesystem-based FXCACHE. No SQLite, no filesystem scanning.
 """
 
 import logging
 import os
-import sqlite3
-import subprocess
-import threading
-import time
+
+import lmdb
 
 logger = logging.getLogger(__name__)
 
 
-class FxcacheDB:
-    def __init__(self, db_path: str, fxcache_path: str):
-        self.db_path = db_path
-        self.fxcache_path = fxcache_path
-        self._write_lock = threading.Lock()
-        self._refresh_running = False
-        self._refresh_status = {'status': 'idle'}
-        self._init_db()
+class LmdbStore:
+    def __init__(self, lmdb_path: str, map_size: int = 512 * 1024 * 1024 * 1024):
+        self.lmdb_path = lmdb_path
+        self.env = lmdb.open(
+            lmdb_path,
+            map_size=map_size,
+            subdir=True,
+            lock=True,
+            readahead=False,
+            meminit=False,
+            max_dbs=0,
+        )
 
-    def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.row_factory = sqlite3.Row
-        return conn
+    def get(self, key: str) -> bytes | None:
+        with self.env.begin() as txn:
+            return txn.get(key.encode('utf-8'))
 
-    def _init_db(self):
-        conn = self._get_conn()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS files (
-                    path TEXT PRIMARY KEY,
-                    size INTEGER NOT NULL,
-                    mtime REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-            """)
-            conn.commit()
-        finally:
-            conn.close()
+    def put(self, key: str, value: bytes):
+        with self.env.begin(write=True) as txn:
+            txn.put(key.encode('utf-8'), value)
 
-    def _get_meta(self, key: str) -> str | None:
-        conn = self._get_conn()
-        try:
-            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
-            return row['value'] if row else None
-        finally:
-            conn.close()
+    def exists(self, key: str) -> bool:
+        with self.env.begin() as txn:
+            return txn.get(key.encode('utf-8')) is not None
 
-    def _set_meta(self, conn, key: str, value: str):
-        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    def exists_batch(self, keys: list[str]) -> dict[str, bool]:
+        results = {}
+        with self.env.begin() as txn:
+            for key in keys:
+                results[key] = txn.get(key.encode('utf-8')) is not None
+        return results
 
-    def get_last_refresh_time(self) -> float | None:
-        """Return the timestamp of the last completed refresh, or None."""
-        val = self._get_meta('last_refresh_timestamp')
-        return float(val) if val else None
+    def delete(self, key: str) -> bool:
+        with self.env.begin(write=True) as txn:
+            return txn.delete(key.encode('utf-8'))
 
-    def exists(self, path: str) -> dict:
-        conn = self._get_conn()
-        try:
-            row = conn.execute(
-                "SELECT size, mtime FROM files WHERE path = ?", (path,)
-            ).fetchone()
-            if row:
-                return {'exists': True, 'size': row['size'], 'mtime': row['mtime']}
-            return {'exists': False}
-        finally:
-            conn.close()
-
-    def exists_batch(self, paths: list) -> dict:
-        conn = self._get_conn()
-        try:
-            results = {}
-            # Process in chunks to avoid SQLite variable limit
-            chunk_size = 500
-            for i in range(0, len(paths), chunk_size):
-                chunk = paths[i:i + chunk_size]
-                placeholders = ','.join('?' * len(chunk))
-                rows = conn.execute(
-                    f"SELECT path, size FROM files WHERE path IN ({placeholders})",
-                    chunk
-                ).fetchall()
-                found = {row['path']: {'exists': True, 'size': row['size']} for row in rows}
-                for p in chunk:
-                    results[p] = found.get(p, {'exists': False})
-            return results
-        finally:
-            conn.close()
-
-    def upsert(self, path: str, size: int, mtime: float):
-        with self._write_lock:
-            conn = self._get_conn()
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
-                    (path, size, mtime)
-                )
-                conn.commit()
-            finally:
-                conn.close()
-
-    def file_count(self) -> int:
-        conn = self._get_conn()
-        try:
-            row = conn.execute("SELECT COUNT(*) as cnt FROM files").fetchone()
-            return row['cnt']
-        finally:
-            conn.close()
-
-    def refresh(self, mode: str = 'auto'):
-        """Start a refresh. mode: 'auto', 'full', or 'incremental'."""
-        if self._refresh_running:
-            return False
-        if mode == 'auto':
-            mode = 'incremental' if self.get_last_refresh_time() else 'full'
-        self._refresh_running = True
-        self._refresh_status = {
-            'status': 'running',
-            'mode': mode,
-            'files_scanned': 0,
-            'files_added': 0,
-            'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    def get_stats(self) -> dict:
+        stat = self.env.stat()
+        info = self.env.info()
+        # Actual data size on disk
+        data_file = os.path.join(self.lmdb_path, 'data.mdb')
+        db_size_bytes = os.path.getsize(data_file) if os.path.exists(data_file) else 0
+        return {
+            'entries': stat['entries'],
+            'map_size_gb': round(info['map_size'] / (1024 ** 3), 1),
+            'db_size_mb': round(db_size_bytes / (1024 ** 2), 1),
         }
-        t = threading.Thread(target=self._refresh_worker, args=(mode,), daemon=True)
-        t.start()
-        return True
 
-    # Keep old name as alias
-    def refresh_full(self):
-        return self.refresh(mode='full')
+    def count_prefix(self, prefix: str) -> int:
+        count = 0
+        prefix_bytes = prefix.encode('utf-8')
+        with self.env.begin() as txn:
+            cursor = txn.cursor()
+            if cursor.set_range(prefix_bytes):
+                for key, _ in cursor:
+                    if key.startswith(prefix_bytes):
+                        count += 1
+                    else:
+                        break
+        return count
 
-    def _refresh_worker(self, mode: str):
-        if mode == 'incremental':
-            self._refresh_incremental()
-        else:
-            self._refresh_full()
-
-    def _refresh_incremental(self):
-        """Index files newer than last refresh using macOS Spotlight (mdfind)."""
-        start = time.time()
-        since = self.get_last_refresh_time() or 0
-        added = 0
-        try:
-            # Convert timestamp to days ago for mdfind
-            days_ago = (time.time() - since) / 86400
-            # Add a small buffer to avoid missing files at the boundary
-            days_ago = days_ago + 0.01
-
-            result = subprocess.run(
-                ['mdfind', '-onlyin', self.fxcache_path,
-                 f'kMDItemFSContentChangeDate >= $time.today(-{days_ago})'],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"mdfind failed: {result.stderr.strip()}")
-
-            paths = [p for p in result.stdout.splitlines() if p]
-            self._refresh_status['files_scanned'] = len(paths)
-
-            conn = self._get_conn()
-            batch = []
-            for full_path in paths:
-                if os.path.basename(full_path).startswith('.'):
-                    continue
-                if not os.path.isfile(full_path):
-                    continue
-                try:
-                    st = os.stat(full_path)
-                except OSError:
-                    continue
-                rel_path = os.path.relpath(full_path, self.fxcache_path)
-                batch.append((rel_path, st.st_size, st.st_mtime))
-                added += 1
-                if len(batch) >= 500:
-                    self._refresh_status['files_added'] = added
-                    with self._write_lock:
-                        conn.executemany(
-                            "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
-                            batch
-                        )
-                        conn.commit()
-                    batch = []
-
-            if batch:
-                with self._write_lock:
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
-                        batch
-                    )
-                    conn.commit()
-
-            # Update meta
-            refresh_ts = time.time()
-            with self._write_lock:
-                self._set_meta(conn, 'last_refresh_timestamp', str(refresh_ts))
-                self._set_meta(conn, 'last_refresh', time.strftime('%Y-%m-%dT%H:%M:%S'))
-                conn.commit()
-
-            conn.close()
-            duration = time.time() - start
-            self._refresh_status = {
-                'status': 'complete',
-                'mode': 'incremental',
-                'files_from_spotlight': len(paths),
-                'files_added': added,
-                'duration_seconds': round(duration, 1),
-            }
-            logger.info(f"Incremental refresh (Spotlight): {len(paths)} candidates, {added} indexed in {duration:.1f}s")
-
-        except Exception as e:
-            logger.error(f"Incremental refresh failed: {e}")
-            self._refresh_status = {'status': 'error', 'error': str(e)}
-        finally:
-            self._refresh_running = False
-
-    def _refresh_full(self):
-        start = time.time()
-        scanned = 0
-        found_paths = set()
-        try:
-            conn = self._get_conn()
-            batch = []
-            for dirpath, _dirnames, filenames in os.walk(self.fxcache_path):
-                for fname in filenames:
-                    if fname.startswith('.'):
-                        continue
-                    full_path = os.path.join(dirpath, fname)
-                    rel_path = os.path.relpath(full_path, self.fxcache_path)
-                    try:
-                        st = os.stat(full_path)
-                        batch.append((rel_path, st.st_size, st.st_mtime))
-                        found_paths.add(rel_path)
-                    except OSError:
-                        continue
-                    scanned += 1
-                    if scanned % 1000 == 0:
-                        self._refresh_status['files_scanned'] = scanned
-                        # Flush batch
-                        with self._write_lock:
-                            conn.executemany(
-                                "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
-                                batch
-                            )
-                            conn.commit()
-                        batch = []
-
-            # Flush remaining
-            if batch:
-                with self._write_lock:
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO files (path, size, mtime) VALUES (?, ?, ?)",
-                        batch
-                    )
-                    conn.commit()
-
-            # Remove stale entries
-            existing = conn.execute("SELECT path FROM files").fetchall()
-            stale = [row['path'] for row in existing if row['path'] not in found_paths]
-            if stale:
-                with self._write_lock:
-                    for i in range(0, len(stale), 500):
-                        chunk = stale[i:i + 500]
-                        placeholders = ','.join('?' * len(chunk))
-                        conn.execute(f"DELETE FROM files WHERE path IN ({placeholders})", chunk)
-                    conn.commit()
-
-            # Update meta
-            refresh_ts = time.time()
-            with self._write_lock:
-                self._set_meta(conn, 'last_refresh_timestamp', str(refresh_ts))
-                self._set_meta(conn, 'last_refresh', time.strftime('%Y-%m-%dT%H:%M:%S'))
-                self._set_meta(conn, 'file_count', str(scanned))
-                conn.commit()
-
-            conn.close()
-            duration = time.time() - start
-            self._refresh_status = {
-                'status': 'complete',
-                'mode': 'full',
-                'total_files': scanned,
-                'stale_removed': len(stale),
-                'duration_seconds': round(duration, 1),
-            }
-            logger.info(f"Full refresh: {scanned} files indexed, {len(stale)} stale removed in {duration:.1f}s")
-
-        except Exception as e:
-            logger.error(f"Full refresh failed: {e}")
-            self._refresh_status = {'status': 'error', 'error': str(e)}
-        finally:
-            self._refresh_running = False
-
-    def get_refresh_status(self) -> dict:
-        return dict(self._refresh_status)
+    def close(self):
+        self.env.close()

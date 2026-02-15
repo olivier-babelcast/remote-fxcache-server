@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Remote FXCACHE server.
+Remote FXCACHE server — LMDB front-end.
 
-Serves cache files over HTTP for LAN cache sharing.
-Uses SQLite for fast file existence checks.
+Serves cache entries over HTTP from an LMDB database (DARTDb).
 
 Usage:
     python server.py
     python server.py --port 5002
-    python server.py --fxcache-path /Volumes/FD_1TB_EXT/FXCACHE
+    python server.py --lmdb-path /Volumes/FD_1TB_EXT/DARTDb
 """
 
 import argparse
@@ -16,12 +15,11 @@ import json as _json
 import logging
 import os
 import socket
-import threading
 from datetime import datetime
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request
 
-from db import FxcacheDB
+from db import LmdbStore
 
 app = Flask(__name__)
 
@@ -37,14 +35,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Globals set at startup
-db: FxcacheDB = None
-FXCACHE_PATH: str = ''
-_upload_lock = threading.Lock()
+store: LmdbStore = None
+LMDB_PATH: str = ''
 
 # Stats
 stats = {
-    'downloads': 0,
-    'uploads': 0,
+    'gets': 0,
+    'puts': 0,
     'exists_checks': 0,
     'errors': 0,
     'bytes_sent': 0,
@@ -64,76 +61,16 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
-FXCACHE_VERSION = '8'  # Must match constants.FXCACHE_VERSION in FX5
-
-
-def _lmdb_key_to_path(key: str) -> str | None:
-    """Map an LMDB key to a FXCACHE relative file path.
-
-    Allows clients using the new LMDB key scheme to download from
-    the FXCACHE-backed server without needing to know file paths.
-    """
-    parts = key.split(':')
-    prefix = parts[0]
-
-    if prefix == 'tb' and len(parts) >= 3:
-        return f"TB/{parts[1]}_{':'.join(parts[2:])}.pkl"
-    if prefix == 'mt' and len(parts) >= 2:
-        rest = ':'.join(parts[1:])
-        return f"MT/result_{rest}.pkl" if rest.startswith('0x') else f"MT/{rest}.pkl"
-    if prefix == 'fit' and len(parts) >= 2:
-        return f"FIT/opt_{parts[1]}.pkl"
-    if prefix == 'tt' and len(parts) >= 2:
-        return f"TT/cached_{parts[1]}.pkl"
-    if prefix == 'price' and len(parts) >= 6:
-        broker, session, tf, instr = parts[1], parts[2], parts[3], parts[4]
-        name = ':'.join(parts[5:])
-        return f"{broker}-{session}-tf_{tf}/{instr}/{name}.pkl"
-    if prefix == 'meta' and len(parts) >= 4:
-        broker, instr = parts[1], parts[2]
-        name = ':'.join(parts[3:])
-        return f"{FXCACHE_VERSION}/{broker}/{instr}/{name}.json"
-    return None
-
-
-def _resolve_path(path_or_key: str) -> str | None:
-    """Resolve a path parameter — accepts both FXCACHE paths and LMDB keys."""
-    if not path_or_key:
-        return None
-    # Detect LMDB key format (starts with known prefix followed by colon)
-    if ':' in path_or_key and path_or_key.split(':')[0] in ('tb', 'mt', 'fit', 'tt', 'price', 'meta'):
-        resolved = _lmdb_key_to_path(path_or_key)
-        if resolved:
-            return _validate_path(resolved)
-        return None
-    return _validate_path(path_or_key)
-
-
-def _validate_path(rel_path: str) -> str | None:
-    """Validate and normalize a relative path. Returns None if invalid."""
-    if not rel_path:
-        return None
-    if '..' in rel_path or rel_path.startswith('/') or '\x00' in rel_path:
-        return None
-    normalized = os.path.normpath(rel_path)
-    if normalized.startswith('..'):
-        return None
-    return normalized
-
-
 # --- Endpoints ---
 
 @app.route('/', methods=['GET'])
 def index():
     endpoints = [
-        ('GET',  '/health',         'Health check with stats'),
-        ('GET',  '/exists?path=',   'Check file existence'),
+        ('GET',  '/health',         'Health check with LMDB stats'),
+        ('GET',  '/exists?key=',    'Check key existence'),
         ('POST', '/exists_batch',   'Batch existence check'),
-        ('GET',  '/download?path=', 'Download a file'),
-        ('POST', '/upload?path=',   'Upload a file'),
-        ('GET',  '/refresh',        'Incremental refresh (Spotlight)'),
-        ('GET',  '/rebuild',        'Full rebuild (walks entire FXCACHE)'),
-        ('GET',  '/refresh/status', 'Refresh/rebuild progress'),
+        ('GET',  '/get?key=',       'Get value by key'),
+        ('POST', '/put?key=',       'Store value for key'),
         ('POST', '/debug/log',      'Post debug log from a machine'),
         ('GET',  '/debug/log',      'Get debug logs (?machine=X)'),
         ('GET',  '/debug/log/list', 'List machines with logs'),
@@ -143,10 +80,10 @@ def index():
         f'<tr><td>{method}</td><td><a href="{path}">{path}</a></td><td>{desc}</td></tr>'
         for method, path, desc in endpoints
     )
-    return f'''<html><head><title>Remote FXCACHE Server</title>
+    return f'''<html><head><title>Remote FXCACHE Server (LMDB)</title>
 <style>body{{font-family:monospace;margin:2em}}table{{border-collapse:collapse}}
 td,th{{padding:4px 12px;text-align:left;border-bottom:1px solid #ddd}}</style>
-</head><body><h2>Remote FXCACHE Server</h2>
+</head><body><h2>Remote FXCACHE Server (LMDB)</h2>
 <table><tr><th>Method</th><th>Path</th><th>Description</th></tr>{rows}</table>
 </body></html>'''
 
@@ -156,9 +93,8 @@ def health():
     uptime = (datetime.now() - stats['start_time']).total_seconds() if stats['start_time'] else 0
     return jsonify({
         'status': 'ok',
-        'fxcache_path': FXCACHE_PATH,
-        'db_file_count': db.file_count(),
-        'last_refresh': db._get_meta('last_refresh'),
+        'lmdb_path': LMDB_PATH,
+        'lmdb_stats': store.get_stats(),
         'uptime_seconds': round(uptime, 1),
         'stats': stats,
     })
@@ -166,99 +102,62 @@ def health():
 
 @app.route('/exists', methods=['GET'])
 def exists():
-    rel_path = request.args.get('path', '')
-    validated = _resolve_path(rel_path)
-    if validated is None:
-        return jsonify({'error': 'Invalid path'}), 400
+    key = request.args.get('key', '')
+    if not key:
+        return jsonify({'error': 'Missing key parameter'}), 400
     stats['exists_checks'] += 1
-    return jsonify(db.exists(validated))
+    return jsonify({'exists': store.exists(key), 'key': key})
 
 
 @app.route('/exists_batch', methods=['POST'])
 def exists_batch():
     data = request.get_json(silent=True)
-    if not data or 'paths' not in data:
-        return jsonify({'error': 'Missing paths field'}), 400
-    paths = data['paths']
-    if not isinstance(paths, list) or len(paths) > 500:
-        return jsonify({'error': 'paths must be a list of max 500 items'}), 400
-    validated = []
-    for p in paths:
-        v = _validate_path(p)
-        if v is None:
-            return jsonify({'error': f'Invalid path: {p}'}), 400
-        validated.append(v)
-    stats['exists_checks'] += len(validated)
-    return jsonify({'results': db.exists_batch(validated)})
+    if not data or 'keys' not in data:
+        return jsonify({'error': 'Missing keys field'}), 400
+    keys = data['keys']
+    if not isinstance(keys, list) or len(keys) > 10000:
+        return jsonify({'error': 'keys must be a list of max 10000 items'}), 400
+    stats['exists_checks'] += len(keys)
+    return jsonify({'results': store.exists_batch(keys)})
 
 
-@app.route('/download', methods=['GET'])
-def download():
-    rel_path = request.args.get('path', '')
-    validated = _resolve_path(rel_path)
-    if validated is None:
-        return jsonify({'error': 'Invalid path'}), 400
-    full_path = os.path.join(FXCACHE_PATH, validated)
-    if not os.path.isfile(full_path):
-        return jsonify({'error': 'File not found'}), 404
+@app.route('/get', methods=['GET'])
+def get_value():
+    key = request.args.get('key', '')
+    if not key:
+        return jsonify({'error': 'Missing key parameter'}), 400
     try:
-        size = os.path.getsize(full_path)
-        stats['downloads'] += 1
-        stats['bytes_sent'] += size
-        return send_file(full_path, mimetype='application/octet-stream')
+        value = store.get(key)
+        if value is None:
+            return jsonify({'error': 'Key not found', 'key': key}), 404
+        stats['gets'] += 1
+        stats['bytes_sent'] += len(value)
+        return Response(value, mimetype='application/octet-stream')
     except Exception as e:
         stats['errors'] += 1
-        logger.error(f"Download error for {validated}: {e}")
+        logger.error(f"Get error for {key}: {e}")
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    rel_path = request.args.get('path', '')
-    validated = _resolve_path(rel_path)
-    if validated is None:
-        return jsonify({'error': 'Invalid path'}), 400
-    full_path = os.path.join(FXCACHE_PATH, validated)
+@app.route('/put', methods=['POST'])
+def put_value():
+    key = request.args.get('key', '')
+    if not key:
+        return jsonify({'error': 'Missing key parameter'}), 400
     data = request.get_data()
     if not data:
         return jsonify({'error': 'Empty body'}), 400
     try:
-        with _upload_lock:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, 'wb') as f:
-                f.write(data)
+        store.put(key, data)
         size = len(data)
-        mtime = os.path.getmtime(full_path)
-        db.upsert(validated, size, mtime)
-        stats['uploads'] += 1
+        stats['puts'] += 1
         stats['bytes_received'] += size
-        logger.info(f"Uploaded {validated} ({size} bytes)")
-        return jsonify({'status': 'ok', 'path': validated, 'size': size})
+        logger.info(f"Put {key} ({size} bytes)")
+        return jsonify({'status': 'ok', 'key': key, 'size': size})
     except Exception as e:
         stats['errors'] += 1
-        logger.error(f"Upload error for {validated}: {e}")
+        logger.error(f"Put error for {key}: {e}")
         return jsonify({'error': str(e)}), 500
-
-
-@app.route('/refresh', methods=['POST', 'GET'])
-def refresh():
-    started = db.refresh(mode='incremental')
-    if not started:
-        return jsonify({'status': 'already_running'}), 409
-    return jsonify({'status': 'started', 'mode': 'incremental', 'message': 'Incremental refresh started (Spotlight)'})
-
-
-@app.route('/rebuild', methods=['POST', 'GET'])
-def rebuild():
-    started = db.refresh(mode='full')
-    if not started:
-        return jsonify({'status': 'already_running'}), 409
-    return jsonify({'status': 'started', 'mode': 'full', 'message': 'Full rebuild started (walks entire FXCACHE)'})
-
-
-@app.route('/refresh/status', methods=['GET'])
-def refresh_status():
-    return jsonify(db.get_refresh_status())
 
 
 # --- Debug log sharing ---
@@ -323,7 +222,6 @@ def _diff_logs(log1: dict, log2: dict, name1: str, name2: str) -> list:
         v1 = log1.get(key)
         v2 = log2.get(key)
         if isinstance(v1, list) and isinstance(v2, list) and len(v1) == len(v2):
-            # Compare list items (e.g. processors_shas)
             for i, (item1, item2) in enumerate(zip(v1, v2)):
                 if isinstance(item1, dict) and isinstance(item2, dict):
                     for k in sorted(set(item1.keys()) | set(item2.keys())):
@@ -336,7 +234,6 @@ def _diff_logs(log1: dict, log2: dict, name1: str, name2: str) -> list:
                 elif item1 != item2:
                     diffs.append({'key': f'{key}[{i}]', name1: item1, name2: item2})
         elif v1 != v2:
-            # Truncate long strings for readability
             d = {'key': key}
             d[name1] = str(v1)[:500] if isinstance(v1, str) and len(str(v1)) > 500 else v1
             d[name2] = str(v2)[:500] if isinstance(v2, str) and len(str(v2)) > 500 else v2
@@ -348,15 +245,17 @@ def _diff_logs(log1: dict, log2: dict, name1: str, name2: str) -> list:
 
 def print_startup_banner(host: str, port: int):
     local_ip = get_local_ip()
+    lmdb_stats = store.get_stats()
     print()
     print("=" * 60)
-    print("Remote FXCACHE Server")
+    print("Remote FXCACHE Server (LMDB)")
     print("=" * 60)
     print(f"Local IP:    {local_ip}")
     print(f"Port:        {port}")
     print(f"URL:         \033]8;;http://{local_ip}:{port}\033\\http://{local_ip}:{port}\033]8;;\033\\")
-    print(f"FXCACHE:     {FXCACHE_PATH}")
-    print(f"DB files:    {db.file_count()}")
+    print(f"LMDB path:   {LMDB_PATH}")
+    print(f"Entries:     {lmdb_stats['entries']:,}")
+    print(f"DB size:     {lmdb_stats['db_size_mb']:,.1f} MB")
     print("=" * 60)
     print()
     base = f"http://{local_ip}:{port}"
@@ -365,13 +264,10 @@ def print_startup_banner(host: str, port: int):
 
     print("Endpoints:")
     print(f"  GET  {_link('/health', '/health'):<50s} Health check")
-    print(f"  GET  {_link('/exists?path=', '/exists?path='):<50s} Check file existence (fast)")
+    print(f"  GET  {_link('/exists?key=', '/exists?key='):<50s} Check key existence")
     print(f"  POST {_link('/exists_batch', '/exists_batch'):<50s} Batch existence check")
-    print(f"  GET  {_link('/download?path=', '/download?path='):<50s} Download file (LMDB keys or paths)")
-    print(f"  POST {_link('/upload?path=', '/upload?path='):<50s} Upload file (LMDB keys or paths)")
-    print(f"  GET  {_link('/refresh', '/refresh'):<50s} Incremental refresh (Spotlight)")
-    print(f"  GET  {_link('/rebuild', '/rebuild'):<50s} Full rebuild (walks entire FXCACHE)")
-    print(f"  GET  {_link('/refresh/status', '/refresh/status'):<50s} Refresh/rebuild progress")
+    print(f"  GET  {_link('/get?key=', '/get?key='):<50s} Get value by key")
+    print(f"  POST {_link('/put?key=', '/put?key='):<50s} Store value for key")
     print(f"  POST {_link('/debug/log', '/debug/log'):<50s} Post debug log from a machine")
     print(f"  GET  {_link('/debug/log', '/debug/log'):<50s} Get debug logs (?machine=X)")
     print(f"  GET  {_link('/debug/log/list', '/debug/log/list'):<50s} List machines with logs")
@@ -380,38 +276,24 @@ def print_startup_banner(host: str, port: int):
 
 
 def main():
-    global db, FXCACHE_PATH
+    global store, LMDB_PATH
 
-    parser = argparse.ArgumentParser(description='Remote FXCACHE server')
+    parser = argparse.ArgumentParser(description='Remote FXCACHE server (LMDB)')
     parser.add_argument('--port', type=int, default=int(os.environ.get('FXCACHE_SERVER_PORT', 5002)),
                         help='Port to listen on (default: 5002)')
     parser.add_argument('--host', type=str, default=os.environ.get('FXCACHE_SERVER_HOST', '0.0.0.0'),
                         help='Host to bind to (default: 0.0.0.0)')
-    parser.add_argument('--fxcache-path', type=str,
-                        default=os.environ.get('FXCACHE_PATH', '/Volumes/FD_1TB_EXT/FXCACHE'),
-                        help='Path to FXCACHE directory')
+    parser.add_argument('--lmdb-path', type=str,
+                        default=os.environ.get('LMDB_PATH', '/Volumes/FD_1TB_EXT/DARTDb'),
+                        help='Path to LMDB directory (default: /Volumes/FD_1TB_EXT/DARTDb)')
     args = parser.parse_args()
 
-    FXCACHE_PATH = os.path.realpath(args.fxcache_path)
-    if not os.path.isdir(FXCACHE_PATH):
-        logger.error(f"FXCACHE path does not exist: {FXCACHE_PATH}")
+    LMDB_PATH = os.path.realpath(args.lmdb_path)
+    if not os.path.isdir(LMDB_PATH):
+        logger.error(f"LMDB path does not exist: {LMDB_PATH}")
         return
 
-    db_path = os.path.join(FXCACHE_PATH, '.fxcache_index.db')
-    db = FxcacheDB(db_path, FXCACHE_PATH)
-
-    # Auto-refresh: full if DB is empty, incremental if DB has a previous refresh
-    if db.file_count() == 0:
-        logger.info("Database is empty, starting full refresh...")
-        db.refresh(mode='full')
-    else:
-        last = db.get_last_refresh_time()
-        if last:
-            logger.info(f"Database has {db.file_count()} files, starting incremental refresh...")
-            db.refresh(mode='incremental')
-        else:
-            logger.info(f"Database has {db.file_count()} files but no refresh timestamp, starting full refresh...")
-            db.refresh(mode='full')
+    store = LmdbStore(LMDB_PATH)
 
     stats['start_time'] = datetime.now()
     print_startup_banner(args.host, args.port)
