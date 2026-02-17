@@ -35,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Globals set at startup
-store: LmdbStore = None
+store: LmdbStore | None = None
 LMDB_PATH: str = ''
 
 # Stats
@@ -48,6 +48,15 @@ stats = {
     'bytes_received': 0,
     'start_time': None,
 }
+
+
+def _get_store() -> LmdbStore:
+    global store, LMDB_PATH
+    if store is None:
+        LMDB_PATH = os.path.realpath(os.environ.get('LMDB_PATH', '/Volumes/FD_1TB_EXT/DARTDb'))
+        store = LmdbStore(LMDB_PATH)
+        stats['start_time'] = datetime.now()
+    return store
 
 
 def get_local_ip() -> str:
@@ -94,7 +103,7 @@ def health():
     return jsonify({
         'status': 'ok',
         'lmdb_path': LMDB_PATH,
-        'lmdb_stats': store.get_stats(),
+        'lmdb_stats': _get_store().get_stats(),
         'uptime_seconds': round(uptime, 1),
         'stats': stats,
     })
@@ -106,7 +115,7 @@ def exists():
     if not key:
         return jsonify({'error': 'Missing key parameter'}), 400
     stats['exists_checks'] += 1
-    return jsonify({'exists': store.exists(key), 'key': key})
+    return jsonify({'exists': _get_store().exists(key), 'key': key})
 
 
 @app.route('/exists_batch', methods=['POST'])
@@ -118,7 +127,7 @@ def exists_batch():
     if not isinstance(keys, list) or len(keys) > 10000:
         return jsonify({'error': 'keys must be a list of max 10000 items'}), 400
     stats['exists_checks'] += len(keys)
-    return jsonify({'results': store.exists_batch(keys)})
+    return jsonify({'results': _get_store().exists_batch(keys)})
 
 
 @app.route('/get', methods=['GET'])
@@ -127,7 +136,7 @@ def get_value():
     if not key:
         return jsonify({'error': 'Missing key parameter'}), 400
     try:
-        value = store.get(key)
+        value = _get_store().get(key)
         if value is None:
             return jsonify({'error': 'Key not found', 'key': key}), 404
         stats['gets'] += 1
@@ -148,7 +157,7 @@ def put_value():
     if not data:
         return jsonify({'error': 'Empty body'}), 400
     try:
-        store.put(key, data)
+        _get_store().put(key, data)
         size = len(data)
         stats['puts'] += 1
         stats['bytes_received'] += size
@@ -245,7 +254,7 @@ def _diff_logs(log1: dict, log2: dict, name1: str, name2: str) -> list:
 
 def print_startup_banner(host: str, port: int):
     local_ip = get_local_ip()
-    lmdb_stats = store.get_stats()
+    lmdb_stats = _get_store().get_stats()
     print()
     print("=" * 60)
     print("Remote FXCACHE Server (LMDB)")
